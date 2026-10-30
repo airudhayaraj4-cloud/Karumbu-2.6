@@ -1,0 +1,168 @@
+name: Build Android APK (கரும்பு 2)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    name: Generate Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Prepare Web Assets
+        run: |
+          # If a zip archive was uploaded, extract it automatically
+          if ls *.zip 1> /dev/null 2>&1; then
+            echo "Extracting zip archive..."
+            unzip -o *.zip
+          fi
+
+          # If the user downloaded index.html multiple times on phone, detect index (1).html, karumbu-kanakku-standalone.html etc.
+          for f in index\ \(*\).html index_*.html karumbu-kanakku-standalone*.html; do
+            if [ -f "$f" ]; then
+              echo "Detected renamed file $f, copying to index.html..."
+              cp -f "$f" index.html
+            fi
+          done
+
+          mkdir -p www
+          STANDALONE_USED=false
+
+          # 1. PRIORITY CHECK: Ensure candidate is real standalone bundle (> 100KB), not small cookie redirect
+          for candidate in "index.html" "offline-apk/index.html" "public/offline-apk/index.html" "karumbu-kanakku-standalone.html"; do
+            if [ -f "$candidate" ]; then
+              FILE_SIZE=$(wc -c < "$candidate")
+              if [ "$FILE_SIZE" -gt 100000 ] && [ "$STANDALONE_USED" = false ]; then
+                echo ">> SUCCESS: Found valid standalone app bundle in $candidate ($FILE_SIZE bytes). Using directly for APK!"
+                cp -f "$candidate" www/index.html
+                STANDALONE_USED=true
+              elif [ "$FILE_SIZE" -le 100000 ]; then
+                echo ">> WARNING: '$candidate' is too small ($FILE_SIZE bytes, likely incomplete download or cookie redirect). Discarding it..."
+                rm -f "$candidate"
+              fi
+            fi
+          done
+
+          # 2. If no valid standalone HTML found, compile freshly from source code
+          if [ "$STANDALONE_USED" = false ]; then
+            if [ -f "package.json" ] && [ -d "src" ]; then
+              echo ">> Full project repository detected. Running npm install & npm run build from source..."
+              npm install --legacy-peer-deps
+              npm run build
+              if [ -d "dist" ]; then
+                cp -r dist/* www/
+              fi
+              if [ -f "dist/offline-apk/index.html" ]; then
+                cp -f dist/offline-apk/index.html www/index.html
+              fi
+              STANDALONE_USED=true
+            elif [ -d "dist/assets" ] && [ -f "dist/index.html" ]; then
+              echo ">> Dist assets found, copying to www..."
+              cp -r dist/* www/
+              STANDALONE_USED=true
+            fi
+          fi
+
+          # Final verification
+          if [ ! -f "www/index.html" ] || grep -qi "cookie_check" www/index.html 2>/dev/null; then
+            echo "ERROR: www/index.html is missing or invalid! Checking fallbacks..."
+            if [ -f "public/offline-apk/index.html" ]; then
+              cp -f public/offline-apk/index.html www/index.html
+            fi
+          fi
+
+          # Copy assets if present
+          if [ -d "assets" ]; then
+            cp -r assets www/
+          fi
+
+          [ -f manifest.json ] && cp manifest.json www/manifest.json || true
+          [ -f pwa-192x192.png ] && cp pwa-192x192.png www/pwa-192x192.png || true
+          [ -f pwa-512x512.png ] && cp pwa-512x512.png www/pwa-512x512.png || true
+          [ -f pwa-maskable-512x512.png ] && cp pwa-maskable-512x512.png www/pwa-maskable-512x512.png || true
+          [ -f icon.svg ] && cp icon.svg www/icon.svg || true
+          [ -f apple-touch-icon.png ] && cp apple-touch-icon.png www/apple-touch-icon.png || true
+
+      - name: Initialize Capacitor Android Project
+        run: |
+          npm init -y
+          npm install @capacitor/core@latest @capacitor/cli@latest @capacitor/android@latest @capacitor/share@latest @capacitor/filesystem@latest
+          if [ ! -f "capacitor.config.json" ]; then
+            cat << 'EOF' > capacitor.config.json
+          {
+            "appId": "com.karumbukanakku.app2",
+            "appName": "கரும்பு 2",
+            "webDir": "www",
+            "bundledWebRuntime": false,
+            "server": {
+              "androidScheme": "https",
+              "cleartext": true
+            },
+            "plugins": {
+              "SplashScreen": {
+                "launchShowDuration": 1500,
+                "launchAutoHide": true,
+                "backgroundColor": "#14532d",
+                "showSpinner": false
+              }
+            }
+          }
+          EOF
+          fi
+          npx cap add android
+          MA=$(find android/app/src/main/java -name MainActivity.java | head -n 1)
+          PKG=$(grep -m1 '^package ' "$MA" | sed 's/package \(.*\);/\1/')
+          echo "Patching $MA (package $PKG) to add native Print"
+          cat > "$MA" << JAVAEOF
+          package $PKG;
+
+          import android.content.ActivityNotFoundException;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.print.PrintAttributes;
+          import android.print.PrintDocumentAdapter;
+          import android.print.PrintManager;
+          import android.util.Base64;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebView;
+          import androidx.activity.result.ActivityResult;
+          import androidx.activity.result.ActivityResultCallback;
+          import androidx.activity.result.ActivityResultLauncher;
+          import androidx.activity.result.contract.ActivityResultContracts;
+          import androidx.core.content.FileProvider;
+          import com.getcapacitor.BridgeActivity;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.OutputStream;
+          import org.json.JSONObject;
+
+          public class MainActivity extends BridgeActivity {
+            private ActivityResultLauncher<Intent> saveLauncher;
+            private byte[] pendingData;
+            private WebView wv;
+
+            @Override
+            public void onCreate(Bundle savedInstanceState) {
+              super.onCreate(savedInstanceState);
+              wv = getBridge().getWebView();
+              saveLauncher = registerForActivityResult(new ActivityResultContracts.StartActivityForResult(), new ActivityResultCallback<ActivityResult>() {
+                @Override
+                public void onActivityResult(ActivityResult result) {
