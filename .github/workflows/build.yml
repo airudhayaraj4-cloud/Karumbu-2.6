@@ -166,3 +166,121 @@ jobs:
               saveLauncher = registerForActivityResult(new ActivityResultContracts.StartActivityForResult(), new ActivityResultCallback<ActivityResult>() {
                 @Override
                 public void onActivityResult(ActivityResult result) {
+                  boolean ok = false;
+                  String msg = "cancel";
+                  Intent data = result.getData();
+                  if (result.getResultCode() == RESULT_OK && data != null && data.getData() != null && pendingData != null) {
+                    try {
+                      OutputStream os = getContentResolver().openOutputStream(data.getData());
+                      os.write(pendingData);
+                      os.close();
+                      ok = true;
+                      msg = "ok";
+                    } catch (Exception e) {
+                      msg = String.valueOf(e.getMessage());
+                    }
+                  }
+                  pendingData = null;
+                  final String js = "window.__karumbuSaved&&window.__karumbuSaved(" + ok + "," + JSONObject.quote(msg) + ")";
+                  wv.post(new Runnable() {
+                    @Override
+                    public void run() {
+                      wv.evaluateJavascript(js, null);
+                    }
+                  });
+                }
+              });
+              wv.addJavascriptInterface(new NativeApi(), "AndroidNative");
+            }
+
+            public class NativeApi {
+              @JavascriptInterface
+              public void print() {
+                MainActivity.this.runOnUiThread(new Runnable() {
+                  @Override
+                  public void run() {
+                    PrintManager pm = (PrintManager) MainActivity.this.getSystemService(Context.PRINT_SERVICE);
+                    PrintDocumentAdapter adapter = wv.createPrintDocumentAdapter("Karumbu");
+                    pm.print("Karumbu", adapter, new PrintAttributes.Builder().build());
+                  }
+                });
+              }
+
+              @JavascriptInterface
+              public boolean saveFile(String name, String mime, String b64) {
+                try {
+                  pendingData = Base64.decode(b64, Base64.DEFAULT);
+                  final Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                  i.addCategory(Intent.CATEGORY_OPENABLE);
+                  i.setType(mime);
+                  i.putExtra(Intent.EXTRA_TITLE, name);
+                  MainActivity.this.runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                      saveLauncher.launch(i);
+                    }
+                  });
+                  return true;
+                } catch (Exception e) {
+                  pendingData = null;
+                  return false;
+                }
+              }
+
+              @JavascriptInterface
+              public boolean sendImage(String phone, String b64, String name, String text) {
+                try {
+                  byte[] bytes = Base64.decode(b64, Base64.DEFAULT);
+                  File f = new File(getCacheDir(), "slip_" + System.currentTimeMillis() + ".png");
+                  FileOutputStream fo = new FileOutputStream(f);
+                  fo.write(bytes);
+                  fo.close();
+                  Uri uri = FileProvider.getUriForFile(MainActivity.this, getPackageName() + ".fileprovider", f);
+                  String digits = phone == null ? "" : phone.replaceAll("[^0-9]", "");
+                  if (digits.length() == 10) digits = "91" + digits;
+                  String[] pkgs = new String[] { "com.whatsapp", "com.whatsapp.w4b" };
+                  for (String p : pkgs) {
+                    Intent i = new Intent(Intent.ACTION_SEND);
+                    i.setType("image/png");
+                    i.putExtra(Intent.EXTRA_STREAM, uri);
+                    if (text != null && text.length() > 0) i.putExtra(Intent.EXTRA_TEXT, text);
+                    if (digits.length() > 0) i.putExtra("jid", digits + "@s.whatsapp.net");
+                    i.setPackage(p);
+                    i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+                    try {
+                      MainActivity.this.startActivity(i);
+                      return true;
+                    } catch (ActivityNotFoundException e) {
+                    }
+                  }
+                } catch (Exception e) {
+                }
+                return false;
+              }
+            }
+          }
+          JAVAEOF
+          npx cap sync android
+
+      - name: Build Debug Android APK
+        run: |
+          cd android
+          chmod +x ./gradlew
+          RUN_NUM="${{ github.run_number }}"
+          V_CODE=$((200 + RUN_NUM))
+          V_NAME="1.4.${RUN_NUM}"
+          echo "Building APK with versionCode=${V_CODE} and versionName=${V_NAME}..."
+          ./gradlew assembleDebug -PversionCode=${V_CODE} -PversionName="${V_NAME}" --no-daemon
+
+      - name: Prepare APK Output
+        run: |
+          mkdir -p apk-output
+          cp android/app/build/outputs/apk/debug/app-debug.apk apk-output/Karumbu-Kanakku2.apk
+          echo "APK successfully built: $(ls -lh apk-output/Karumbu-Kanakku2.apk)"
+
+      - name: Upload APK as GitHub Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Karumbu-Kanakku2-Android-APK
+          path: apk-output/Karumbu-Kanakku2.apk
+          retention-days: 30
